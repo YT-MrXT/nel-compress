@@ -1,0 +1,4 @@
+# O litterbox não envia cabeçalhos CORS, por isso o browser recusa falar com ele
+# diretamente. Este rewrite faz o Netlify reencaminhar o pedido do lado do
+# servidor, onde o CORS não se aplica. Sem código, sem função, sem pasta.
+/api/litterbox  https://litterbox.catbox.moe/resources/internals/api.php  200
