@@ -1,6 +1,10 @@
 // ---------------------------------------------------------------------------
 // PATCHER: interpolação de frames com Framegen (WebGPU)
 // ---------------------------------------------------------------------------
+// Substitui o ONNX Runtime + RIFE-lite. O ganho não vem só do modelo ser mais
+// pequeno (2.9 MB contra 30 MB): vem de os cálculos serem kernels WebGPU
+// escritos à mão, sem a camada genérica de um framework de ML pelo meio.
+//
 // Isto NÃO é compressão. Gera frames que não existiam, para dobrar a fluidez
 // do movimento. O ficheiro de saída fica normalmente maior que o original.
 //
@@ -21,7 +25,8 @@ import {
 
 const FRAMEGEN = 'https://cdn.jsdelivr.net/npm/framegen@1.4.0';
 
-// O runtime exige lados múltiplos de 16.
+// O runtime exige lados múltiplos de 16. Acima de 1080 no lado curto o custo
+// dispara sem ganho visível, porque o modelo não foi treinado para mais.
 const MAX_SHORT_SIDE = 1080;
 const round16 = (n) => Math.max(16, Math.round(n / 16) * 16);
 
@@ -74,6 +79,14 @@ async function createRuntime(outW, outH, onStatus) {
 // O frame chega no tamanho original e o modelo trabalha noutro, por isso passa
 // primeiro por um canvas 2D que o redimensiona. A cópia para a textura é feita
 // pela GPU: os píxeis nunca chegam a ser lidos para a memória do processador.
+// A cópia entre texturas é gravada num codificador de comandos e só depois
+// submetida à fila. A fila em si não tem este método.
+function copyTexture(device, from, to, width, height) {
+  const encoder = device.createCommandEncoder();
+  encoder.copyTextureToTexture({ texture: from }, { texture: to }, [width, height]);
+  device.queue.submit([encoder.finish()]);
+}
+
 function sampleToTexture(sample, device, scaleCanvas, scaleCtx, texture) {
   sample.draw(scaleCtx, 0, 0, scaleCanvas.width, scaleCanvas.height);
   device.queue.copyExternalImageToTexture(
@@ -136,7 +149,8 @@ export async function patchVideo(file, meta, { onProgress, onStatus }) {
   const makeFrameTexture = () => device.createTexture({
     size: [outW, outH],
     format: 'rgba8unorm',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+      | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
   });
 
   let texPrev = makeFrameTexture();
@@ -164,9 +178,7 @@ export async function patchVideo(file, meta, { onProgress, onStatus }) {
 
     if (hasPrev) {
       // 1) frame real anterior, copiado para o canvas de saída
-      device.queue.copyTextureToTexture(
-        { texture: texPrev }, { texture: gpuCtx.getCurrentTexture() }, [outW, outH]
-      );
+      copyTexture(device, texPrev, gpuCtx.getCurrentTexture(), outW, outH);
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
@@ -188,9 +200,7 @@ export async function patchVideo(file, meta, { onProgress, onStatus }) {
 
   // Último frame real, sem par seguinte para interpolar.
   if (hasPrev) {
-    device.queue.copyTextureToTexture(
-      { texture: texPrev }, { texture: gpuCtx.getCurrentTexture() }, [outW, outH]
-    );
+    copyTexture(device, texPrev, gpuCtx.getCurrentTexture(), outW, outH);
     await canvasSource.add(outTimestamp, frameDuration);
   }
 
