@@ -46,12 +46,12 @@ function loadOrt() {
     ortPromise = import('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.bundle.min.mjs')
       .then((mod) => {
         mod.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
-        // As threads WASM exigem SharedArrayBuffer, que por sua vez exige
-        // cross-origin isolation. O netlify.toml já envia COOP/COEP, por isso
-        // isto costuma estar ligado — mas confirma-se em vez de se assumir.
-        mod.env.wasm.numThreads = self.crossOriginIsolated
-          ? (navigator.hardwareConcurrency || 4)
-          : 1;
+        // Uma thread só. Com mais do que uma, o runtime cria um Worker a
+        // partir do seu próprio URL no CDN, e o browser recusa Workers
+        // cross-origin. No caminho WebGPU isto não custa nada: o cálculo
+        // acontece na placa gráfica e as threads do processador não contam.
+        // Para as ligar seria preciso servir o onnxruntime do próprio site.
+        mod.env.wasm.numThreads = 1;
         return mod;
       });
   }
@@ -85,10 +85,7 @@ export function pickEngine() {
 }
 
 export function describeEngine() {
-  if (pickEngine() === 'webgpu') return 'placa gráfica (WebGPU)';
-  return self.crossOriginIsolated
-    ? `processador, ${navigator.hardwareConcurrency || 4} núcleos`
-    : 'processador, 1 núcleo';
+  return pickEngine() === 'webgpu' ? 'placa gráfica (WebGPU)' : 'processador (lento)';
 }
 
 async function createSession(onnxUrl) {
