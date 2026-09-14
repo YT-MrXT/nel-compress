@@ -184,9 +184,18 @@ export async function patchVideo(file, meta, settings) {
     target: new BufferTarget(),
   });
 
+  // Sem esta opção o browser escolhe sozinho e pode cair no codificador por
+  // software, que a 1080p custa centenas de milissegundos por frame em vez de
+  // poucos. O onEncoderConfig regista o que ele decidiu mesmo usar.
+  let encoderInfo = '';
   const canvasSource = new CanvasSource(outCanvas, {
     codec: 'avc',
     bitrate: smaller ? QUALITY_LOW : QUALITY_HIGH,
+    hardwareAcceleration: 'prefer-hardware',
+    latencyMode: 'realtime',
+    onEncoderConfig: (config) => {
+      encoderInfo = `${config.codec} · ${config.hardwareAcceleration ?? 'sem preferência'}`;
+    },
   });
   output.addVideoTrack(canvasSource);
   await output.start();
@@ -216,7 +225,7 @@ export async function patchVideo(file, meta, settings) {
     onStatus?.(
       `frame ${frameIndex}/${estimatedTotal} · ${(perFrame * 1000).toFixed(0)} ms ` +
       `(descodificar ${ms(tDescodificar)} · modelo ${ms(tModelo)} · codificar ${ms(tCodificar)}) ` +
-      `· faltam ~${remaining}s`
+      `· faltam ~${remaining}s · ${encoderInfo}`
     );
     onProgress?.(Math.min(frameIndex / estimatedTotal, 1));
   };
