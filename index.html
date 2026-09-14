@@ -139,13 +139,22 @@
         </div>
       </div>
 
-      <div class="picks" id="patcherPicks" hidden>
-        <p class="note" id="patcherNote">
-          O Patcher gera frames novos com IA para dobrar o fps aparente do vídeo.
-          Não é compressão: o ficheiro final costuma ficar <strong>maior</strong>, não
-          mais pequeno, e o processo é lento (minutos, dependendo da duração do vídeo).
-          Funciona melhor no Chrome/Edge no computador.
-        </p>
+      <div class="picks picks-single" id="patcherPicks" hidden>
+        <div class="pick">
+          <label for="patcherPreset">Método</label>
+          <select id="patcherPreset">
+            <option value="max">Máxima qualidade + FPS — 1080p, fps a dobrar</option>
+            <option value="fps">Só FPS — mantém a resolução original</option>
+            <option value="720p60" selected>720p60 — 720p a 60fps</option>
+          </select>
+        </div>
+
+        <label class="check">
+          <input type="checkbox" id="patcherSmaller" />
+          <span>Reduzir o tamanho do ficheiro</span>
+        </label>
+
+        <p class="note" id="patcherNote"></p>
       </div>
 
       <button type="button" class="go-btn" id="compressBtn">Comprimir</button>
