@@ -18,7 +18,8 @@ import {
   BufferTarget,
   Mp4OutputFormat,
   ALL_FORMATS,
-  CanvasSource,
+  VideoSampleSource,
+  VideoSample,
   VideoSampleSink,
   QUALITY_HIGH,
   QUALITY_LOW,
@@ -191,8 +192,11 @@ export async function patchVideo(file, meta, settings) {
   //
   // latencyMode 'realtime' é o travão que sobra: por omissão é 'quality', que
   // prioriza a qualidade sobre a velocidade em cada frame.
+  // VideoSampleSource em vez de CanvasSource: assim a captura do frame é feita
+  // por nós e pode ser cronometrada à parte da espera pelo codificador. Com o
+  // CanvasSource as duas ficavam dentro do mesmo await, indistinguíveis.
   let encoderInfo = '';
-  const canvasSource = new CanvasSource(outCanvas, {
+  const sampleSource = new VideoSampleSource({
     codec: 'avc',
     bitrate: smaller ? QUALITY_LOW : QUALITY_HIGH,
     latencyMode: 'realtime',
@@ -200,7 +204,7 @@ export async function patchVideo(file, meta, settings) {
       encoderInfo = `${config.codec} · ${config.hardwareAcceleration ?? 'escolha do browser'}`;
     },
   });
-  output.addVideoTrack(canvasSource);
+  output.addVideoTrack(sampleSource);
   await output.start();
 
   const sink = new VideoSampleSink(videoTrack);
@@ -216,7 +220,20 @@ export async function patchVideo(file, meta, settings) {
   // a ser gasto a descodificar o vídeo, a passar pelo modelo, ou a codificar.
   let tDescodificar = 0;
   let tModelo = 0;
+  let tCapturar = 0;
   let tCodificar = 0;
+
+  // Capturar o canvas e entregar ao codificador, medindo cada parte.
+  const gravar = async (timestamp, duration) => {
+    const tA = performance.now();
+    const frame = new VideoSample(outCanvas, { timestamp, duration });
+    tCapturar += performance.now() - tA;
+
+    const tB = performance.now();
+    await sampleSource.add(frame);
+    tCodificar += performance.now() - tB;
+    frame.close();
+  };
 
   const relatar = () => {
     const n = Math.max(frameIndex, 1);
@@ -227,7 +244,7 @@ export async function patchVideo(file, meta, settings) {
 
     onStatus?.(
       `frame ${frameIndex}/${estimatedTotal} · ${(perFrame * 1000).toFixed(0)} ms ` +
-      `(descodificar ${ms(tDescodificar)} · modelo ${ms(tModelo)} · codificar ${ms(tCodificar)}) ` +
+      `(descodificar ${ms(tDescodificar)} · modelo ${ms(tModelo)} · capturar ${ms(tCapturar)} · codificar ${ms(tCodificar)}) ` +
       `· faltam ~${remaining}s · ${encoderInfo}`
     );
     onProgress?.(Math.min(frameIndex / estimatedTotal, 1));
@@ -246,9 +263,7 @@ export async function patchVideo(file, meta, settings) {
       // Sem frames a inventar: desenhar e gravar, um por um.
       sample.draw(scaleCtx, 0, 0, outW, outH);
       sample.close();
-      const t1 = performance.now();
-      await canvasSource.add(outTimestamp, frameDuration);
-      tCodificar += performance.now() - t1;
+      await gravar(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
       frameIndex++;
       relatar();
@@ -263,9 +278,7 @@ export async function patchVideo(file, meta, settings) {
     if (hasPrev) {
       // 1) frame real anterior
       copyTexture(device, texPrev, gpuCtx.getCurrentTexture(), outW, outH);
-      let t1 = performance.now();
-      await canvasSource.add(outTimestamp, frameDuration);
-      tCodificar += performance.now() - t1;
+      await gravar(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
       // 2) frame sintético, escrito pelo modelo diretamente no canvas
@@ -274,9 +287,7 @@ export async function patchVideo(file, meta, settings) {
       rt.runT(0.5, gpuCtx.getCurrentTexture());
       tModelo += performance.now() - t2;
 
-      t1 = performance.now();
-      await canvasSource.add(outTimestamp, frameDuration);
-      tCodificar += performance.now() - t1;
+      await gravar(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
       relatar();
@@ -290,7 +301,7 @@ export async function patchVideo(file, meta, settings) {
   // Último frame real, que não tem par seguinte para interpolar.
   if (interpolate && hasPrev) {
     copyTexture(device, texPrev, gpuCtx.getCurrentTexture(), outW, outH);
-    await canvasSource.add(outTimestamp, frameDuration);
+    await gravar(outTimestamp, frameDuration);
   }
 
   texPrev?.destroy();
