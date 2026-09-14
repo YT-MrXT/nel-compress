@@ -69,11 +69,19 @@ export const patcherMode = {
     '(minutos, não segundos, dependendo da duração do vídeo).',
 };
 
+// 113 dos 185 pesos deste modelo vivem num ficheiro separado (.onnx.data). O
+// ONNX Runtime não o descobre sozinho a partir de um URL: é preciso indicá-lo.
+// O 'path' tem de ser exatamente a string que o .onnx referencia internamente.
+const WEIGHTS_FILE = 'rife425_lite.onnx.data';
+
 async function createSession(onnxUrl) {
   const ort = await loadOrt();
+  const weightsUrl = new URL(WEIGHTS_FILE, new URL(onnxUrl, location.href)).href;
+
   return ort.InferenceSession.create(onnxUrl, {
     executionProviders: ['wasm'],
     graphOptimizationLevel: 'all',
+    externalData: [{ path: WEIGHTS_FILE, data: weightsUrl }],
   });
 }
 
@@ -151,7 +159,16 @@ async function interpolateMidFrame(session, ort, sampleA, sampleB, tmpCanvas, tm
 // ---------------------------------------------------------------------------
 export async function patchVideo(file, meta, { onnxUrl, onProgress, onStatus }) {
   onStatus?.('a carregar o modelo…');
-  const [session, ort] = await Promise.all([createSession(onnxUrl), loadOrt()]);
+  let session, ort;
+  try {
+    [session, ort] = await Promise.all([createSession(onnxUrl), loadOrt()]);
+  } catch (err) {
+    throw new Error(
+      typeof err === 'number'
+        ? `O modelo não carregou (código interno ${err}). Confirma que ${WEIGHTS_FILE} está publicado ao lado do .onnx.`
+        : `O modelo não carregou: ${err.message}`
+    );
+  }
 
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
   const videoTrack = await input.getPrimaryVideoTrack();
