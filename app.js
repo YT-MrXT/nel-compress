@@ -1,6 +1,6 @@
 import { imageMode, validateImage, describeImage, compressImage, isLossless } from './image.js';
 import { videoMode, validateVideo, describeVideo, compressVideo } from './video.js';
-import { patchVideo } from './patcher.js';
+import { patchVideo, pixelCost } from './patcher.js';
 
 const el = (id) => document.getElementById(id);
 
@@ -78,6 +78,41 @@ function currentMode() {
   return MODES[mode];
 }
 
+// Cada método é um par (resolução, fps de destino). O 'double' significa
+// dobrar o que o vídeo já tiver.
+const PATCHER_METHODS = {
+  max:      { shortSide: 1080,     targetFps: 'double' },
+  fps:      { shortSide: 'source', targetFps: 'double' },
+  '720p60': { shortSide: 720,      targetFps: 60 },
+};
+
+function patcherSettings() {
+  return { ...PATCHER_METHODS[el('patcherPreset').value], smaller: el('patcherSmaller').checked };
+}
+
+function updatePatcherNote() {
+  const { shortSide, targetFps } = patcherSettings();
+
+  if (!sourceMeta) {
+    el('patcherNote').textContent = 'Escolhe um ficheiro para ver quanto tempo cada método leva.';
+    return;
+  }
+
+  const lado = shortSide === 'source' ? Math.min(sourceMeta.width, sourceMeta.height) : shortSide;
+  const custo = pixelCost(sourceMeta, lado);
+  const vezes = (pixelCost(sourceMeta, 1080) / custo).toFixed(1);
+
+  // Os fps do vídeo só se sabem ao contá-los durante a descodificação, por
+  // isso aqui diz-se a condição em vez de se afirmar o que ainda não sabemos.
+  const velocidade = custo > pixelCost(sourceMeta, 1080)
+    ? 'Mantém a resolução original, por isso é o método mais pesado de todos.'
+    : `Cerca de ${vezes}× mais rápido que o método de 1080p.`;
+
+  el('patcherNote').textContent = targetFps === 'double'
+    ? `${velocidade} Gera frames novos com IA, por isso o ficheiro final costuma ficar maior.`
+    : `${velocidade} Se o vídeo já tiver ${targetFps}fps, não há frames para gerar e fica quase instantâneo.`;
+}
+
 function updateNote() {
   if (mode === 'image') {
     el('setupNote').textContent = isLossless(el('format').value)
@@ -114,6 +149,7 @@ function setMode(next) {
   el('videoPicks').hidden = next !== 'video';
   el('imagePicks').hidden = next !== 'image';
   el('patcherPicks').hidden = next !== 'patcher';
+  updatePatcherNote();
   el('dial').hidden = next === 'patcher';
 
   config.steps.forEach((word, index) => {
@@ -149,6 +185,7 @@ async function intake(file) {
 
   sourceMeta = await DESCRIBE[mode](file);
   el('fileSub').textContent = `${sourceMeta.label} · ${formatBytes(file.size)}`;
+  if (mode === 'patcher') updatePatcherNote();
   updateNote();
 }
 
@@ -168,6 +205,7 @@ async function run() {
       resultBlob = await compressImage(sourceFile, q, el('format').value);
     } else if (mode === 'patcher') {
       resultBlob = await patchVideo(sourceFile, sourceMeta, {
+        ...patcherSettings(),
         onStatus: (msg) => { el('workSub').textContent = msg; },
         onProgress: (p) => {
           el('workLabel').textContent = `A gerar frames · ${Math.round(p * 100)}%`;
@@ -278,6 +316,8 @@ quality.addEventListener('input', () => {
 });
 
 el('format').addEventListener('change', updateNote);
+el('patcherPreset').addEventListener('change', updatePatcherNote);
+el('patcherSmaller').addEventListener('change', updatePatcherNote);
 el('compressBtn').addEventListener('click', run);
 el('swapBtn').addEventListener('click', reset);
 el('againBtn').addEventListener('click', reset);
