@@ -40,7 +40,10 @@ import {
 let ortPromise = null;
 function loadOrt() {
   if (!ortPromise) {
-    ortPromise = import('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs')
+    // Tem de ser este ficheiro, e não o ort.min.mjs: o mapa de exportações do
+    // pacote indica ort.webgpu.bundle.min.mjs como o ponto de entrada ESM que
+    // regista o backend WebGPU. Este bundle traz WebGPU e WASM, os dois.
+    ortPromise = import('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.bundle.min.mjs')
       .then((mod) => {
         mod.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
         // As threads WASM exigem SharedArrayBuffer, que por sua vez exige
