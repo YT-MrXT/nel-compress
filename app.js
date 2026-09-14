@@ -57,17 +57,36 @@ function clearAlert() {
   el('alert').classList.remove('is-shown');
 }
 
-const MODES = { image: imageMode, video: videoMode };
+const MODES = {
+  image: imageMode,
+  video: videoMode,
+  patcher: {
+    accept: videoMode.accept,
+    pageTitle: 'Patcher — dobrar frames com IA',
+    heading: 'Escolhe o teu vídeo',
+    formats: videoMode.formats,
+    selectLabel: videoMode.selectLabel,
+    note: 'Isto gera frames novos com IA — não é compressão. O ficheiro final costuma ficar maior, não mais pequeno.',
+    lede: 'Gera frames novos entre os reais para dobrar o fps aparente do vídeo. É lento (minutos) e experimental.',
+    setupHeading: 'Confirma antes de começar',
+    setupSub: 'O processo corre inteiramente no teu browser e pode demorar vários minutos.',
+    steps: ['Ficheiro', 'Confirmar', 'Transferir'],
+    action: 'Gerar frames',
+  },
+};
 
 function currentMode() {
   return MODES[mode];
 }
 
 function updateNote() {
-  el('setupNote').textContent =
-    mode === 'image' && isLossless(el('format').value)
+  if (mode === 'image') {
+    el('setupNote').textContent = isLossless(el('format').value)
       ? 'O PNG não tem perdas: o valor de qualidade não se aplica e o ficheiro fica quase sempre maior. Escolhe WebP ou JPG para o encolher.'
       : currentMode().note;
+  } else {
+    el('setupNote').textContent = currentMode().note;
+  }
 }
 
 // ---------- modo ----------
@@ -95,6 +114,8 @@ function setMode(next) {
   el('compressBtn').textContent = config.action;
   el('videoPicks').hidden = next !== 'video';
   el('imagePicks').hidden = next !== 'image';
+  el('patcherPicks').hidden = next !== 'patcher';
+  el('dial').hidden = next === 'patcher';
 
   config.steps.forEach((word, index) => {
     el(`stepWord${index + 1}`).textContent = word;
@@ -108,8 +129,8 @@ function setMode(next) {
 async function intake(file) {
   clearAlert();
 
-  const VALIDATE = { image: validateImage, video: validateVideo };
-  const DESCRIBE = { image: describeImage, video: describeVideo };
+  const VALIDATE = { image: validateImage, video: validateVideo, patcher: validateVideo };
+  const DESCRIBE = { image: describeImage, video: describeVideo, patcher: describeVideo };
 
   try {
     VALIDATE[mode](file);
@@ -136,7 +157,7 @@ async function intake(file) {
 async function run() {
   clearAlert();
   show('work');
-  el('workLabel').textContent = 'A comprimir';
+  el('workLabel').textContent = mode === 'patcher' ? 'A gerar frames' : 'A comprimir';
   el('trackFill').style.width = '0%';
 
   const q = Number(quality.value);
@@ -145,6 +166,15 @@ async function run() {
     if (mode === 'image') {
       el('trackFill').style.width = '60%';
       resultBlob = await compressImage(sourceFile, q, el('format').value);
+    } else if (mode === 'patcher') {
+      resultBlob = await patchVideo(sourceFile, sourceMeta, {
+        onnxUrl: PATCHER_ONNX_URL,
+        onStatus: (msg) => { el('workSub').textContent = msg; },
+        onProgress: (p) => {
+          el('workLabel').textContent = `A gerar frames · ${Math.round(p * 100)}%`;
+          el('trackFill').style.width = `${p * 100}%`;
+        },
+      });
     } else {
       const settings = {
         quality: q,
@@ -152,27 +182,15 @@ async function run() {
         fps: el('fps').value,
       };
 
-      if (el('patcherToggle').checked) {
-        el('workLabel').textContent = 'A gerar frames (Patcher)';
-        resultBlob = await patchVideo(sourceFile, sourceMeta, {
-          onnxUrl: PATCHER_ONNX_URL,
-          onStatus: (msg) => { el('workSub').textContent = msg; },
-          onProgress: (p) => {
-            el('workLabel').textContent = `A gerar frames · ${Math.round(p * 100)}%`;
-            el('trackFill').style.width = `${p * 100}%`;
-          },
-        });
-      } else {
-        resultBlob = await compressVideo(sourceFile, sourceMeta, settings, {
-          onLoadProgress: () => {
-            el('workLabel').textContent = 'A preparar';
-          },
-          onProgress: (p) => {
-            el('workLabel').textContent = `A comprimir · ${Math.round(p * 100)}%`;
-            el('trackFill').style.width = `${p * 100}%`;
-          },
-        });
-      }
+      resultBlob = await compressVideo(sourceFile, sourceMeta, settings, {
+        onLoadProgress: () => {
+          el('workLabel').textContent = 'A preparar';
+        },
+        onProgress: (p) => {
+          el('workLabel').textContent = `A comprimir · ${Math.round(p * 100)}%`;
+          el('trackFill').style.width = `${p * 100}%`;
+        },
+      });
     }
   } catch (err) {
     showAlert(err.message);
@@ -190,7 +208,9 @@ function renderResult() {
   const saved = Math.round((1 - after / before) * 100);
 
   el('verdictNum').textContent = `${saved >= 0 ? '−' : '+'}${Math.abs(saved)}%`;
-  document.querySelector('.verdict-word').textContent = saved >= 0 ? 'mais leve' : 'mais pesado';
+  document.querySelector('.verdict-word').textContent = mode === 'patcher'
+    ? (saved >= 0 ? 'mais leve' : 'mais pesado (normal com o Patcher)')
+    : (saved >= 0 ? 'mais leve' : 'mais pesado');
 
   el('sizeBefore').textContent = formatBytes(before);
   el('sizeAfter').textContent = formatBytes(after);
@@ -259,9 +279,6 @@ quality.addEventListener('input', () => {
 
 el('format').addEventListener('change', updateNote);
 el('compressBtn').addEventListener('click', run);
-el('patcherToggle').addEventListener('change', (e) => {
-  el('patcherNote').style.display = e.target.checked ? 'block' : 'none';
-});
 el('swapBtn').addEventListener('click', reset);
 el('againBtn').addEventListener('click', reset);
 el('downloadBtn').addEventListener('click', download);

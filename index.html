@@ -24,6 +24,7 @@
     <div class="tabs" role="tablist" aria-label="Tipo de ficheiro">
       <button class="tab is-active" role="tab" aria-selected="true" data-mode="image">Imagem</button>
       <button class="tab" role="tab" aria-selected="false" data-mode="video">Vídeo</button>
+      <button class="tab" role="tab" aria-selected="false" data-mode="patcher">Patcher</button>
     </div>
 
     <span class="topbar-pill">
@@ -138,16 +139,12 @@
         </div>
       </div>
 
-      <div class="pick" id="patcherPick" style="margin-top: 1rem;">
-        <label style="display:flex; align-items:center; gap:.5rem; cursor:pointer;">
-          <input type="checkbox" id="patcherToggle" />
-          Patcher — dobrar frames com IA (experimental)
-        </label>
-        <p class="note" id="patcherNote" style="display:none;">
-          Gera frames novos entre os reais para dobrar o fps aparente. Não é compressão:
-          o ficheiro final costuma ficar <strong>maior</strong>, não mais pequeno, e o
-          processo é lento (minutos, dependendo da duração do vídeo). Corre melhor no
-          Chrome/Edge no computador.
+      <div class="picks" id="patcherPicks" hidden>
+        <p class="note" id="patcherNote">
+          O Patcher gera frames novos com IA para dobrar o fps aparente do vídeo.
+          Não é compressão: o ficheiro final costuma ficar <strong>maior</strong>, não
+          mais pequeno, e o processo é lento (minutos, dependendo da duração do vídeo).
+          Funciona melhor no Chrome/Edge no computador.
         </p>
       </div>
 
