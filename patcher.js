@@ -1,10 +1,6 @@
 // ---------------------------------------------------------------------------
 // PATCHER: interpolação de frames com Framegen (WebGPU)
 // ---------------------------------------------------------------------------
-// Substitui o ONNX Runtime + RIFE-lite. O ganho não vem só do modelo ser mais
-// pequeno (2.9 MB contra 30 MB): vem de os cálculos serem kernels WebGPU
-// escritos à mão, sem a camada genérica de um framework de ML pelo meio.
-//
 // Isto NÃO é compressão. Gera frames que não existiam, para dobrar a fluidez
 // do movimento. O ficheiro de saída fica normalmente maior que o original.
 //
@@ -25,8 +21,7 @@ import {
 
 const FRAMEGEN = 'https://cdn.jsdelivr.net/npm/framegen@1.4.0';
 
-// O runtime exige lados múltiplos de 16. Acima de 1080 no lado curto o custo
-// dispara sem ganho visível, porque o modelo não foi treinado para mais.
+// O runtime exige lados múltiplos de 16.
 const MAX_SHORT_SIDE = 1080;
 const round16 = (n) => Math.max(16, Math.round(n / 16) * 16);
 
@@ -65,14 +60,27 @@ async function createRuntime(outW, outH, onStatus) {
     fetch(`${FRAMEGEN}/weights/rt_v7s.json`).then((r) => r.json()),
   ]);
 
-  return createRT(device, { w: outW, h: outH, weightsBin, weightsManifest });
+  // Estes pesos ("tfact") só funcionam em modo de texturas: o runtime recusa
+  // o modo de buffers. É também o modo rápido — os píxeis ficam na GPU.
+  const rt = await createRT(device, {
+    w: outW, h: outH, weightsBin, weightsManifest,
+    textureInput: true,
+    textureOutput: true,
+  });
+
+  return { rt, device };
 }
 
-// Desenha um frame descodificado no canvas de saída e devolve os píxeis em
-// bruto, que é o formato que o runtime aceita.
-function toRgba(sample, canvas, ctx) {
-  sample.draw(ctx, 0, 0, canvas.width, canvas.height);
-  return new Uint8Array(ctx.getImageData(0, 0, canvas.width, canvas.height).data.buffer);
+// O frame chega no tamanho original e o modelo trabalha noutro, por isso passa
+// primeiro por um canvas 2D que o redimensiona. A cópia para a textura é feita
+// pela GPU: os píxeis nunca chegam a ser lidos para a memória do processador.
+function sampleToTexture(sample, device, scaleCanvas, scaleCtx, texture) {
+  sample.draw(scaleCtx, 0, 0, scaleCanvas.width, scaleCanvas.height);
+  device.queue.copyExternalImageToTexture(
+    { source: scaleCanvas },
+    { texture },
+    [scaleCanvas.width, scaleCanvas.height]
+  );
 }
 
 export async function patchVideo(file, meta, { onProgress, onStatus }) {
@@ -82,7 +90,7 @@ export async function patchVideo(file, meta, { onProgress, onStatus }) {
   const outW = round16(meta.width * shrink);
   const outH = round16(meta.height * shrink);
 
-  const rt = await createRuntime(outW, outH, onStatus);
+  const { rt, device } = await createRuntime(outW, outH, onStatus);
 
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
   const videoTrack = await input.getPrimaryVideoTrack();
@@ -106,17 +114,40 @@ export async function patchVideo(file, meta, { onProgress, onStatus }) {
     if (count > 0) sourceFps = count / Math.min(1, duration);
   }
 
+  // Canvas 2D só para redimensionar; nunca se lêem píxeis dele.
+  const scaleCanvas = document.createElement('canvas');
+  scaleCanvas.width = outW;
+  scaleCanvas.height = outH;
+  const scaleCtx = scaleCanvas.getContext('2d');
+
+  // Canvas WebGPU: é daqui que o codificador tira cada frame, e é aqui que o
+  // runtime escreve os frames sintéticos, sem passarem pelo processador.
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = outW;
+  outCanvas.height = outH;
+  const gpuCtx = outCanvas.getContext('webgpu');
+  gpuCtx.configure({
+    device,
+    format: 'rgba8unorm',
+    alphaMode: 'opaque',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+
+  const makeFrameTexture = () => device.createTexture({
+    size: [outW, outH],
+    format: 'rgba8unorm',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+
+  let texPrev = makeFrameTexture();
+  let texCur = makeFrameTexture();
+
   const output = new Output({
     format: new Mp4OutputFormat({ fastStart: 'in-memory' }),
     target: new BufferTarget(),
   });
 
-  const canvas = document.createElement('canvas');
-  canvas.width = outW;
-  canvas.height = outH;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-  const canvasSource = new CanvasSource(canvas, { codec: 'avc', bitrate: QUALITY_HIGH });
+  const canvasSource = new CanvasSource(outCanvas, { codec: 'avc', bitrate: QUALITY_HIGH });
   output.addVideoTrack(canvasSource);
   await output.start();
 
@@ -124,40 +155,47 @@ export async function patchVideo(file, meta, { onProgress, onStatus }) {
   const frameDuration = 1 / (sourceFps * 2);
   const estimatedTotal = Math.max(Math.round(duration * sourceFps), 1);
 
-  let prevRgba = null;
+  let hasPrev = false;
   let outTimestamp = 0;
   let frameIndex = 0;
 
   for await (const sample of sink.samples()) {
-    const rgba = toRgba(sample, canvas, ctx);
-    sample.close();
+    sampleToTexture(sample, device, scaleCanvas, scaleCtx, texCur);
 
-    if (prevRgba) {
-      // O frame real anterior já está desenhado quando o escrevemos abaixo,
-      // por isso reordena-se: primeiro o anterior, depois o sintético.
-      ctx.putImageData(new ImageData(new Uint8ClampedArray(prevRgba), outW, outH), 0, 0);
+    if (hasPrev) {
+      // 1) frame real anterior, copiado para o canvas de saída
+      device.queue.copyTextureToTexture(
+        { texture: texPrev }, { texture: gpuCtx.getCurrentTexture() }, [outW, outH]
+      );
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
+      // 2) frame sintético, escrito diretamente no canvas pelo runtime
       onStatus?.(`a gerar frame ${frameIndex} de ~${estimatedTotal}`);
-      const mid = await rt.run(prevRgba, rgba, 0.5);
-      ctx.putImageData(new ImageData(new Uint8ClampedArray(mid), outW, outH), 0, 0);
+      rt.prepPair(texPrev, texCur);
+      rt.runT(0.5, gpuCtx.getCurrentTexture());
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
       onProgress?.(Math.min(frameIndex / estimatedTotal, 1));
     }
 
-    prevRgba = rgba;
+    sample.close();
+    [texPrev, texCur] = [texCur, texPrev];
+    hasPrev = true;
     frameIndex++;
   }
 
   // Último frame real, sem par seguinte para interpolar.
-  if (prevRgba) {
-    ctx.putImageData(new ImageData(new Uint8ClampedArray(prevRgba), outW, outH), 0, 0);
+  if (hasPrev) {
+    device.queue.copyTextureToTexture(
+      { texture: texPrev }, { texture: gpuCtx.getCurrentTexture() }, [outW, outH]
+    );
     await canvasSource.add(outTimestamp, frameDuration);
   }
 
+  texPrev.destroy();
+  texCur.destroy();
   rt.destroy();
   await output.finalize();
 
