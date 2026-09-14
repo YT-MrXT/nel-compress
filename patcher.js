@@ -184,17 +184,20 @@ export async function patchVideo(file, meta, settings) {
     target: new BufferTarget(),
   });
 
-  // Sem esta opção o browser escolhe sozinho e pode cair no codificador por
-  // software, que a 1080p custa centenas de milissegundos por frame em vez de
-  // poucos. O onEncoderConfig regista o que ele decidiu mesmo usar.
+  // Não se força hardwareAcceleration: pedir 'prefer-hardware' faz a
+  // configuração ser rejeitada em resoluções pequenas, porque os codificadores
+  // por hardware têm mínimos. Deixa-se o browser escolher, como a biblioteca
+  // recomenda, e regista-se o que ele escolheu em vez de se assumir.
+  //
+  // latencyMode 'realtime' é o travão que sobra: por omissão é 'quality', que
+  // prioriza a qualidade sobre a velocidade em cada frame.
   let encoderInfo = '';
   const canvasSource = new CanvasSource(outCanvas, {
     codec: 'avc',
     bitrate: smaller ? QUALITY_LOW : QUALITY_HIGH,
-    hardwareAcceleration: 'prefer-hardware',
     latencyMode: 'realtime',
     onEncoderConfig: (config) => {
-      encoderInfo = `${config.codec} · ${config.hardwareAcceleration ?? 'sem preferência'}`;
+      encoderInfo = `${config.codec} · ${config.hardwareAcceleration ?? 'escolha do browser'}`;
     },
   });
   output.addVideoTrack(canvasSource);
