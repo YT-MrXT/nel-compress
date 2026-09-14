@@ -21,6 +21,8 @@ import {
   VideoSampleSource,
   VideoSample,
   VideoSampleSink,
+  EncodedPacketSink,
+  EncodedAudioPacketSource,
   QUALITY_HIGH,
   QUALITY_LOW,
   canEncodeVideo,
@@ -209,7 +211,35 @@ export async function patchVideo(file, meta, settings) {
     ...(hardwarePossivel ? { hardwareAcceleration: 'prefer-hardware' } : {}),
   });
   output.addVideoTrack(sampleSource);
+
+  // O áudio é copiado pacote a pacote, sem passar por descodificador nenhum.
+  // Como a duração total do vídeo não muda (dobram-se os frames mas cada um
+  // dura metade), os tempos do som continuam a bater certo com a imagem.
+  const audioTrack = await input.getPrimaryAudioTrack();
+  let audioSource = null;
+  let audioConfig = null;
+
+  if (audioTrack) {
+    const audioCodec = await audioTrack.getCodec();
+    audioConfig = await audioTrack.getDecoderConfig();
+
+    if (audioCodec && audioConfig) {
+      audioSource = new EncodedAudioPacketSource(audioCodec);
+      output.addAudioTrack(audioSource);
+    }
+  }
+
   await output.start();
+
+  if (audioSource) {
+    const packetSink = new EncodedPacketSink(audioTrack);
+    let first = true;
+    for await (const packet of packetSink.packets()) {
+      // A configuração do descodificador só vai no primeiro pacote.
+      await audioSource.add(packet, first ? { decoderConfig: audioConfig } : undefined);
+      first = false;
+    }
+  }
 
   const sink = new VideoSampleSink(videoTrack);
   const frameDuration = 1 / (interpolate ? sourceFps * 2 : sourceFps);
