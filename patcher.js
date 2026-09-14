@@ -157,14 +157,16 @@ function drawTensorCropped(tensor, box, outW, outH, canvas, ctx) {
   ctx.drawImage(tmp, box.x, box.y, box.w, box.h, 0, 0, outW, outH);
 }
 
-async function interpolateMidFrame(session, ort, sampleA, sampleB, tmpCanvas, tmpCtx, outCanvas, outCtx, outW, outH) {
-  const inA = sampleToModelInput(sampleA, tmpCanvas, tmpCtx);
-  const tA = imageDataToTensor(inA.imageData, ort);
-  const inB = sampleToModelInput(sampleB, tmpCanvas, tmpCtx);
-  const tB = imageDataToTensor(inB.imageData, ort);
+// Prepara um frame uma única vez. O resultado é reaproveitado na iteração
+// seguinte, onde o mesmo frame passa a ser o "anterior" do par.
+function prepare(sample, ort, tmpCanvas, tmpCtx) {
+  const { imageData, box } = sampleToModelInput(sample, tmpCanvas, tmpCtx);
+  return { tensor: imageDataToTensor(imageData, ort), box };
+}
 
-  const results = await session.run({ img0: tA, img1: tB });
-  drawTensorCropped(results.mid_frame, inA.box, outW, outH, outCanvas, outCtx);
+async function interpolateMidFrame(session, prepA, prepB, outCanvas, outCtx, outW, outH) {
+  const results = await session.run({ img0: prepA.tensor, img1: prepB.tensor });
+  drawTensorCropped(results.mid_frame, prepA.box, outW, outH, outCanvas, outCtx);
 }
 
 // ---------------------------------------------------------------------------
@@ -191,8 +193,14 @@ export async function patchVideo(file, meta, { onnxUrl, onProgress, onStatus }) 
   const decodable = await videoTrack.canDecode();
   if (!decodable) throw new Error('Este browser não consegue descodificar este vídeo (codec não suportado).');
 
-  const outW = meta.width;
-  const outH = meta.height;
+  // Recodificar a 4K quase 4000 vezes domina o tempo total, e não compra
+  // nada: os frames sintéticos saem do modelo a 896x512 no máximo, por isso
+  // acima disto estaríamos a inventar detalhe que não existe.
+  const MAX_SHORT_SIDE = 1080;
+  const shortSide = Math.min(meta.width, meta.height);
+  const shrink = shortSide > MAX_SHORT_SIDE ? MAX_SHORT_SIDE / shortSide : 1;
+  const outW = Math.round(meta.width * shrink / 2) * 2;
+  const outH = Math.round(meta.height * shrink / 2) * 2;
 
   const duration = await input.computeDuration();
 
@@ -230,6 +238,7 @@ export async function patchVideo(file, meta, { onnxUrl, onProgress, onStatus }) 
   const sink = new VideoSampleSink(videoTrack);
 
   let prevSample = null;
+  let prevPrep = null;
   let outTimestamp = 0;
   const frameDuration = 1 / (sourceFps * 2);
   let frameIndex = 0;
@@ -245,13 +254,16 @@ export async function patchVideo(file, meta, { onnxUrl, onProgress, onStatus }) 
 
       // 2) frame sintético a meio caminho entre o anterior e o atual
       onStatus?.(`a gerar frame ${frameIndex + 1} de ~${estimatedTotal} — ${describeEngine()}`);
-      await interpolateMidFrame(session, ort, prevSample, sample, tmpCanvas, tmpCtx, outCanvas, outCtx, outW, outH);
+      const prep = prepare(sample, ort, tmpCanvas, tmpCtx);
+      await interpolateMidFrame(session, prevPrep, prep, outCanvas, outCtx, outW, outH);
+      prevPrep = prep;
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
       onProgress?.(Math.min(frameIndex / estimatedTotal, 1));
       prevSample.close();
     }
+    if (!prevPrep) prevPrep = prepare(sample, ort, tmpCanvas, tmpCtx);
     prevSample = sample;
     frameIndex++;
   }
