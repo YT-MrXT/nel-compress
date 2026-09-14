@@ -43,6 +43,12 @@ function loadOrt() {
     ortPromise = import('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs')
       .then((mod) => {
         mod.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+        // Desativa threads WASM de propósito: threads exigem SharedArrayBuffer,
+        // que por sua vez exige cross-origin isolation (COOP/COEP) em todo o
+        // site, incluindo CDNs de terceiros com cabeçalhos CORP corretos —
+        // frágil e difícil de garantir. Single-thread é mais lento mas
+        // funciona em qualquer hospedagem sem configuração extra.
+        mod.env.wasm.numThreads = 1;
         return mod;
       });
   }

@@ -135,7 +135,8 @@ async function intake(file) {
   try {
     VALIDATE[mode](file);
   } catch (err) {
-    showAlert(err.message);
+    console.error('nel-compress validation error:', err);
+    showAlert(err?.message || String(err) || 'Ficheiro inválido.');
     return;
   }
 
@@ -193,7 +194,8 @@ async function run() {
       });
     }
   } catch (err) {
-    showAlert(err.message);
+    console.error('nel-compress error:', err);
+    showAlert(err?.message || String(err) || 'Ocorreu um erro inesperado. Vê a consola (F12) para detalhes.');
     show('setup');
     return;
   }
