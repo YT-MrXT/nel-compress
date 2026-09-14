@@ -7,7 +7,6 @@ const el = (id) => document.getElementById(id);
 // Caminho relativo ao index.html. O ficheiro .onnx.data TEM de estar na
 // mesma pasta com o mesmo nome-base — onnxruntime-web procura-o
 // automaticamente ao lado do .onnx.
-const PATCHER_ONNX_URL = './model/rife425_lite.onnx';
 
 const tabs = document.querySelector('.tabs');
 const dropzone = el('dropzone');
@@ -169,7 +168,6 @@ async function run() {
       resultBlob = await compressImage(sourceFile, q, el('format').value);
     } else if (mode === 'patcher') {
       resultBlob = await patchVideo(sourceFile, sourceMeta, {
-        onnxUrl: PATCHER_ONNX_URL,
         onStatus: (msg) => { el('workSub').textContent = msg; },
         onProgress: (p) => {
           el('workLabel').textContent = `A gerar frames · ${Math.round(p * 100)}%`;
