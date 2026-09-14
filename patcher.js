@@ -43,12 +43,12 @@ function loadOrt() {
     ortPromise = import('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs')
       .then((mod) => {
         mod.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
-        // Desativa threads WASM de propósito: threads exigem SharedArrayBuffer,
-        // que por sua vez exige cross-origin isolation (COOP/COEP) em todo o
-        // site, incluindo CDNs de terceiros com cabeçalhos CORP corretos —
-        // frágil e difícil de garantir. Single-thread é mais lento mas
-        // funciona em qualquer hospedagem sem configuração extra.
-        mod.env.wasm.numThreads = 1;
+        // As threads WASM exigem SharedArrayBuffer, que por sua vez exige
+        // cross-origin isolation. O netlify.toml já envia COOP/COEP, por isso
+        // isto costuma estar ligado — mas confirma-se em vez de se assumir.
+        mod.env.wasm.numThreads = self.crossOriginIsolated
+          ? (navigator.hardwareConcurrency || 4)
+          : 1;
         return mod;
       });
   }
@@ -74,12 +74,26 @@ export const patcherMode = {
 // O 'path' tem de ser exatamente a string que o .onnx referencia internamente.
 const WEIGHTS_FILE = 'rife425_lite.onnx.data';
 
+// A placa gráfica faz este trabalho muito mais depressa que o processador.
+// Sem WebGPU no browser não há alternativa: resta o WASM.
+export function pickEngine() {
+  if ('gpu' in navigator) return 'webgpu';
+  return 'wasm';
+}
+
+export function describeEngine() {
+  if (pickEngine() === 'webgpu') return 'placa gráfica (WebGPU)';
+  return self.crossOriginIsolated
+    ? `processador, ${navigator.hardwareConcurrency || 4} núcleos`
+    : 'processador, 1 núcleo';
+}
+
 async function createSession(onnxUrl) {
   const ort = await loadOrt();
   const weightsUrl = new URL(WEIGHTS_FILE, new URL(onnxUrl, location.href)).href;
 
   return ort.InferenceSession.create(onnxUrl, {
-    executionProviders: ['wasm'],
+    executionProviders: [pickEngine()],
     graphOptimizationLevel: 'all',
     externalData: [{ path: WEIGHTS_FILE, data: weightsUrl }],
   });
@@ -158,7 +172,7 @@ async function interpolateMidFrame(session, ort, sampleA, sampleB, tmpCanvas, tm
 // interpolado entre cada par consecutivo (dobra o fps), recodifica.
 // ---------------------------------------------------------------------------
 export async function patchVideo(file, meta, { onnxUrl, onProgress, onStatus }) {
-  onStatus?.('a carregar o modelo…');
+  onStatus?.(`a carregar o modelo — motor: ${describeEngine()}…`);
   let session, ort;
   try {
     [session, ort] = await Promise.all([createSession(onnxUrl), loadOrt()]);
@@ -230,7 +244,7 @@ export async function patchVideo(file, meta, { onnxUrl, onProgress, onStatus }) 
       outTimestamp += frameDuration;
 
       // 2) frame sintético a meio caminho entre o anterior e o atual
-      onStatus?.(`a gerar frame ${frameIndex + 1} de ~${estimatedTotal}…`);
+      onStatus?.(`a gerar frame ${frameIndex + 1} de ~${estimatedTotal} — ${describeEngine()}`);
       await interpolateMidFrame(session, ort, prevSample, sample, tmpCanvas, tmpCtx, outCanvas, outCtx, outW, outH);
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
