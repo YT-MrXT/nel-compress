@@ -23,6 +23,7 @@ import {
   VideoSampleSink,
   QUALITY_HIGH,
   QUALITY_LOW,
+  canEncodeVideo,
 } from 'https://esm.sh/mediabunny@1.56.2';
 
 const FRAMEGEN = 'https://cdn.jsdelivr.net/npm/framegen@1.4.0';
@@ -185,24 +186,27 @@ export async function patchVideo(file, meta, settings) {
     target: new BufferTarget(),
   });
 
-  // Não se força hardwareAcceleration: pedir 'prefer-hardware' faz a
-  // configuração ser rejeitada em resoluções pequenas, porque os codificadores
-  // por hardware têm mínimos. Deixa-se o browser escolher, como a biblioteca
-  // recomenda, e regista-se o que ele escolheu em vez de se assumir.
+  // VideoSampleSource em vez de CanvasSource: assim a captura do frame fica
+  // separada da espera pelo codificador, e cada uma pode ser cronometrada.
   //
-  // latencyMode 'realtime' é o travão que sobra: por omissão é 'quality', que
-  // prioriza a qualidade sobre a velocidade em cada frame.
-  // VideoSampleSource em vez de CanvasSource: assim a captura do frame é feita
-  // por nós e pode ser cronometrada à parte da espera pelo codificador. Com o
-  // CanvasSource as duas ficavam dentro do mesmo await, indistinguíveis.
-  let encoderInfo = '';
+  // Pedir 'prefer-hardware' às cegas faz a configuração ser rejeitada quando a
+  // resolução é pequena demais para o codificador da placa gráfica. Por isso
+  // pergunta-se primeiro, com a resolução real deste vídeo, e só se pede
+  // hardware quando a resposta é sim.
+  const quality = smaller ? QUALITY_LOW : QUALITY_HIGH;
+  const hardwarePossivel = await canEncodeVideo('avc', {
+    width: outW,
+    height: outH,
+    quality,
+    hardwareAcceleration: 'prefer-hardware',
+  });
+
+  const encoderInfo = hardwarePossivel ? 'hardware' : 'software';
   const sampleSource = new VideoSampleSource({
     codec: 'avc',
-    bitrate: smaller ? QUALITY_LOW : QUALITY_HIGH,
+    bitrate: quality,
     latencyMode: 'realtime',
-    onEncoderConfig: (config) => {
-      encoderInfo = `${config.codec} · ${config.hardwareAcceleration ?? 'escolha do browser'}`;
-    },
+    ...(hardwarePossivel ? { hardwareAcceleration: 'prefer-hardware' } : {}),
   });
   output.addVideoTrack(sampleSource);
   await output.start();
