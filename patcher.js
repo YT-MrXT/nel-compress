@@ -231,16 +231,6 @@ export async function patchVideo(file, meta, settings) {
 
   await output.start();
 
-  if (audioSource) {
-    const packetSink = new EncodedPacketSink(audioTrack);
-    let first = true;
-    for await (const packet of packetSink.packets()) {
-      // A configuração do descodificador só vai no primeiro pacote.
-      await audioSource.add(packet, first ? { decoderConfig: audioConfig } : undefined);
-      first = false;
-    }
-  }
-
   const sink = new VideoSampleSink(videoTrack);
   const frameDuration = 1 / (interpolate ? sourceFps * 2 : sourceFps);
   const estimatedTotal = Math.max(Math.round(duration * sourceFps), 1);
@@ -341,6 +331,21 @@ export async function patchVideo(file, meta, settings) {
   texPrev?.destroy();
   texCur?.destroy();
   rt?.destroy();
+
+  // O áudio é copiado só agora, no fim. Copiá-lo antes punha a faixa de som
+  // dezenas de segundos à frente da de vídeo, e o empacotador ficava a
+  // aguardar que o vídeo a alcançasse — essa espera caía em cada frame.
+  if (audioSource) {
+    onStatus?.('a copiar o áudio…');
+    const packetSink = new EncodedPacketSink(audioTrack);
+    let first = true;
+    for await (const packet of packetSink.packets()) {
+      // A configuração do descodificador só vai no primeiro pacote.
+      await audioSource.add(packet, first ? { decoderConfig: audioConfig } : undefined);
+      first = false;
+    }
+  }
+
   await output.finalize();
 
   return new Blob([output.target.buffer], { type: 'video/mp4' });
