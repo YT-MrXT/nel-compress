@@ -200,41 +200,71 @@ export async function patchVideo(file, meta, settings) {
   let frameIndex = 0;
   const startedAt = performance.now();
 
+  // Medir cada etapa em separado. Sem isto não há como saber se o tempo está
+  // a ser gasto a descodificar o vídeo, a passar pelo modelo, ou a codificar.
+  let tDescodificar = 0;
+  let tModelo = 0;
+  let tCodificar = 0;
+
   const relatar = () => {
+    const n = Math.max(frameIndex, 1);
     const elapsed = (performance.now() - startedAt) / 1000;
-    const perFrame = elapsed / Math.max(frameIndex, 1);
+    const perFrame = elapsed / n;
     const remaining = Math.round(perFrame * (estimatedTotal - frameIndex));
+    const ms = (total) => (total / n).toFixed(0);
+
     onStatus?.(
-      `frame ${frameIndex} de ~${estimatedTotal} · ${(perFrame * 1000).toFixed(0)} ms cada · faltam ~${remaining}s`
+      `frame ${frameIndex}/${estimatedTotal} · ${(perFrame * 1000).toFixed(0)} ms ` +
+      `(descodificar ${ms(tDescodificar)} · modelo ${ms(tModelo)} · codificar ${ms(tCodificar)}) ` +
+      `· faltam ~${remaining}s`
     );
     onProgress?.(Math.min(frameIndex / estimatedTotal, 1));
   };
 
-  for await (const sample of sink.samples()) {
+  const iterador = sink.samples()[Symbol.asyncIterator]();
+
+  while (true) {
+    const t0 = performance.now();
+    const passo = await iterador.next();
+    tDescodificar += performance.now() - t0;
+    if (passo.done) break;
+    const sample = passo.value;
+
     if (!interpolate) {
       // Sem frames a inventar: desenhar e gravar, um por um.
       sample.draw(scaleCtx, 0, 0, outW, outH);
       sample.close();
+      const t1 = performance.now();
       await canvasSource.add(outTimestamp, frameDuration);
+      tCodificar += performance.now() - t1;
       outTimestamp += frameDuration;
       frameIndex++;
       relatar();
       continue;
     }
 
+    const tPrep = performance.now();
     sampleToTexture(sample, device, scaleCanvas, scaleCtx, texCur);
     sample.close();
+    tModelo += performance.now() - tPrep;
 
     if (hasPrev) {
       // 1) frame real anterior
       copyTexture(device, texPrev, gpuCtx.getCurrentTexture(), outW, outH);
+      let t1 = performance.now();
       await canvasSource.add(outTimestamp, frameDuration);
+      tCodificar += performance.now() - t1;
       outTimestamp += frameDuration;
 
       // 2) frame sintético, escrito pelo modelo diretamente no canvas
+      const t2 = performance.now();
       rt.prepPair(texPrev, texCur);
       rt.runT(0.5, gpuCtx.getCurrentTexture());
+      tModelo += performance.now() - t2;
+
+      t1 = performance.now();
       await canvasSource.add(outTimestamp, frameDuration);
+      tCodificar += performance.now() - t1;
       outTimestamp += frameDuration;
 
       relatar();
