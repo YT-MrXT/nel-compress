@@ -195,6 +195,7 @@ async function run() {
   clearAlert();
   show('work');
   el('workLabel').textContent = mode === 'patcher' ? 'A gerar frames' : 'A comprimir';
+  el('workSub').textContent = 'Corre no teu processador. Mantém o separador aberto.';
   el('trackFill').style.width = '0%';
 
   const q = Number(quality.value);
