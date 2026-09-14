@@ -539,6 +539,26 @@ input[type="range"]:focus-visible { outline: 2px solid var(--gold); outline-offs
 .pick select:hover { border-color: #3D424B; }
 .pick select:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
 
+/* caixa de opção */
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.check input {
+  width: 17px;
+  height: 17px;
+  accent-color: var(--gold);
+  cursor: pointer;
+}
+
+.check:hover { color: var(--text); }
+
 /* 3. a trabalhar */
 
 .work-body { padding: 62px 32px 60px; text-align: center; }
