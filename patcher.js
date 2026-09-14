@@ -1,29 +1,15 @@
 // ---------------------------------------------------------------------------
-// PATCHER: interpolação de frames com RIFE (ONNX Runtime Web)
+// PATCHER: interpolação de frames com Framegen (WebGPU)
 // ---------------------------------------------------------------------------
-// Isto NÃO é compressão. Faz o oposto: gera frames novos (sintéticos, gerados
-// por um modelo de fluxo ótico) entre os frames reais, para dobrar o fps
-// aparente de movimento. O ficheiro de saída fica normalmente MAIOR que o
-// original, nunca mais pequeno. Está isolado do resto do nel-compress de
-// propósito — não altera nada do fluxo normal de compressão.
+// Substitui o ONNX Runtime + RIFE-lite. O ganho não vem só do modelo ser mais
+// pequeno (2.9 MB contra 30 MB): vem de os cálculos serem kernels WebGPU
+// escritos à mão, sem a camada genérica de um framework de ML pelo meio.
 //
-// Requisitos:
-//   - rife425_lite.onnx + rife425_lite.onnx.data (mesma pasta, sempre juntos)
-//   - onnxruntime-web (carregado via CDN abaixo)
-//   - Um browser com WebCodecs (Chrome/Edge desktop; suporte móvel é limitado)
+// Isto NÃO é compressão. Gera frames que não existiam, para dobrar a fluidez
+// do movimento. O ficheiro de saída fica normalmente maior que o original.
 //
-// Isto é LENTO. Em CPU/WASM puro, cada frame gerado pode demorar
-// 1-5 segundos. Um vídeo de 10s a 30fps tem ~300 frames a interpolar =
-// 5-25 minutos. Não há atalho para isto sem GPU (WebGPU ajuda mas nem todos
-// os browsers/dispositivos o suportam bem para ONNX ainda).
-//
-// API do mediabunny usada aqui (confirmada em mediabunny.dev/api):
-//   - VideoSampleSink(videoTrack).samples() -> AsyncGenerator<VideoSample>
-//   - sample.draw(ctx, x, y) desenha o frame decodificado num canvas 2D
-//   - sample.close() liberta os recursos do frame (obrigatório, tal como
-//     VideoFrame.close())
-//   - CanvasSource(canvas, { codec, bitrate }).add(timestamp, duration)
-//     captura o estado atual do canvas como um frame de saída
+// Requisitos duros, sem alternativa lenta: WebGPU com shader-f16. Na prática,
+// Chrome/Edge 121+ com placa gráfica. Sem isso, falha com uma mensagem clara.
 
 import {
   Input,
@@ -37,181 +23,83 @@ import {
   QUALITY_HIGH,
 } from 'https://esm.sh/mediabunny@1.56.2';
 
-let ortPromise = null;
-function loadOrt() {
-  if (!ortPromise) {
-    // Tem de ser este ficheiro, e não o ort.min.mjs: o mapa de exportações do
-    // pacote indica ort.webgpu.bundle.min.mjs como o ponto de entrada ESM que
-    // regista o backend WebGPU. Este bundle traz WebGPU e WASM, os dois.
-    ortPromise = import('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.bundle.min.mjs')
-      .then((mod) => {
-        mod.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
-        // Uma thread só. Com mais do que uma, o runtime cria um Worker a
-        // partir do seu próprio URL no CDN, e o browser recusa Workers
-        // cross-origin. No caminho WebGPU isto não custa nada: o cálculo
-        // acontece na placa gráfica e as threads do processador não contam.
-        // Para as ligar seria preciso servir o onnxruntime do próprio site.
-        mod.env.wasm.numThreads = 1;
-        return mod;
-      });
-  }
-  return ortPromise;
-}
+const FRAMEGEN = 'https://cdn.jsdelivr.net/npm/framegen@1.4.0';
 
-// O modelo foi exportado para aceitar exatamente esta resolução (ver
-// export_onnx.py --height 480 --width 896). Frames de outro tamanho são
-// reamostrados (letterbox) para esta caixa e depois recortados de volta.
-const MODEL_H = 512;
-const MODEL_W = 896;
+// O runtime exige lados múltiplos de 16. Acima de 1080 no lado curto o custo
+// dispara sem ganho visível, porque o modelo não foi treinado para mais.
+const MAX_SHORT_SIDE = 1080;
+const round16 = (n) => Math.max(16, Math.round(n / 16) * 16);
 
 export const patcherMode = {
   label: 'Patcher (interpolação de frames)',
   warning:
-    'Isto gera frames novos com IA para dobrar o fps aparente. Não é compressão — ' +
-    'o ficheiro final costuma ficar maior, não mais pequeno, e o processo é lento ' +
-    '(minutos, não segundos, dependendo da duração do vídeo).',
+    'Isto gera frames novos com IA para dobrar o fps. Não é compressão — o ficheiro ' +
+    'final costuma ficar maior. Precisa de Chrome ou Edge com placa gráfica.',
 };
 
-// 113 dos 185 pesos deste modelo vivem num ficheiro separado (.onnx.data). O
-// ONNX Runtime não o descobre sozinho a partir de um URL: é preciso indicá-lo.
-// O 'path' tem de ser exatamente a string que o .onnx referencia internamente.
-const WEIGHTS_FILE = 'rife425_lite.onnx.data';
-
-// A placa gráfica faz este trabalho muito mais depressa que o processador.
-// Sem WebGPU no browser não há alternativa: resta o WASM.
-export function pickEngine() {
-  if ('gpu' in navigator) return 'webgpu';
-  return 'wasm';
-}
-
-export function describeEngine() {
-  return pickEngine() === 'webgpu' ? 'placa gráfica (WebGPU)' : 'processador (lento)';
-}
-
-async function createSession(onnxUrl) {
-  const ort = await loadOrt();
-  const weightsUrl = new URL(WEIGHTS_FILE, new URL(onnxUrl, location.href)).href;
-
-  return ort.InferenceSession.create(onnxUrl, {
-    executionProviders: [pickEngine()],
-    graphOptimizationLevel: 'all',
-    externalData: [{ path: WEIGHTS_FILE, data: weightsUrl }],
-  });
-}
-
-// Desenha um VideoSample num canvas na resolução do modelo (letterbox, sem
-// distorcer o aspect ratio original) e devolve o ImageData + a caixa usada,
-// para depois se poder desfazer o letterbox na saída.
-function sampleToModelInput(sample, canvas, ctx) {
-  canvas.width = MODEL_W;
-  canvas.height = MODEL_H;
-  ctx.fillStyle = 'black';
-  ctx.fillRect(0, 0, MODEL_W, MODEL_H);
-
-  const srcW = sample.displayWidth ?? sample.codedWidth;
-  const srcH = sample.displayHeight ?? sample.codedHeight;
-  const scale = Math.min(MODEL_W / srcW, MODEL_H / srcH);
-  const w = Math.round(srcW * scale);
-  const h = Math.round(srcH * scale);
-  const x = Math.floor((MODEL_W - w) / 2);
-  const y = Math.floor((MODEL_H - h) / 2);
-
-  sample.draw(ctx, x, y, w, h);
-  return { imageData: ctx.getImageData(0, 0, MODEL_W, MODEL_H), box: { x, y, w, h } };
-}
-
-// HWC uint8 RGBA -> CHW float32 RGB [0,1], o formato que o grafo ONNX espera.
-function imageDataToTensor(imageData, ort) {
-  const { data, width, height } = imageData;
-  const chw = new Float32Array(3 * width * height);
-  const plane = width * height;
-  for (let i = 0; i < plane; i++) {
-    chw[i] = data[i * 4] / 255;
-    chw[plane + i] = data[i * 4 + 1] / 255;
-    chw[2 * plane + i] = data[i * 4 + 2] / 255;
-  }
-  return new ort.Tensor('float32', chw, [1, 3, height, width]);
-}
-
-// Inverso: CHW float32 -> desenha no canvas de saída, recortando de volta a
-// área real (desfazendo o letterbox) e esticando ao tamanho de saída.
-function drawTensorCropped(tensor, box, outW, outH, canvas, ctx) {
-  const [, , h, w] = tensor.dims;
-  const data = tensor.data;
-  const plane = w * h;
-  const imageData = new ImageData(w, h);
-  for (let i = 0; i < plane; i++) {
-    imageData.data[i * 4] = Math.max(0, Math.min(255, data[i] * 255));
-    imageData.data[i * 4 + 1] = Math.max(0, Math.min(255, data[plane + i] * 255));
-    imageData.data[i * 4 + 2] = Math.max(0, Math.min(255, data[2 * plane + i] * 255));
-    imageData.data[i * 4 + 3] = 255;
+async function getDevice() {
+  if (!('gpu' in navigator)) {
+    throw new Error('Este browser não tem WebGPU. Usa o Chrome ou o Edge no computador.');
   }
 
-  const tmp = document.createElement('canvas');
-  tmp.width = w;
-  tmp.height = h;
-  tmp.getContext('2d').putImageData(imageData, 0, 0);
-
-  canvas.width = outW;
-  canvas.height = outH;
-  ctx.drawImage(tmp, box.x, box.y, box.w, box.h, 0, 0, outW, outH);
-}
-
-// Prepara um frame uma única vez. O resultado é reaproveitado na iteração
-// seguinte, onde o mesmo frame passa a ser o "anterior" do par.
-function prepare(sample, ort, tmpCanvas, tmpCtx) {
-  const { imageData, box } = sampleToModelInput(sample, tmpCanvas, tmpCtx);
-  return { tensor: imageDataToTensor(imageData, ort), box };
-}
-
-async function interpolateMidFrame(session, prepA, prepB, outCanvas, outCtx, outW, outH) {
-  const results = await session.run({ img0: prepA.tensor, img1: prepB.tensor });
-  drawTensorCropped(results.mid_frame, prepA.box, outW, outH, outCanvas, outCtx);
-}
-
-// ---------------------------------------------------------------------------
-// Pipeline principal: decodifica o vídeo frame a frame, insere um frame
-// interpolado entre cada par consecutivo (dobra o fps), recodifica.
-// ---------------------------------------------------------------------------
-export async function patchVideo(file, meta, { onnxUrl, onProgress, onStatus }) {
-  onStatus?.(`a carregar o modelo — motor: ${describeEngine()}…`);
-  let session, ort;
-  try {
-    [session, ort] = await Promise.all([createSession(onnxUrl), loadOrt()]);
-  } catch (err) {
-    throw new Error(
-      typeof err === 'number'
-        ? `O modelo não carregou (código interno ${err}). Confirma que ${WEIGHTS_FILE} está publicado ao lado do .onnx.`
-        : `O modelo não carregou: ${err.message}`
-    );
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    throw new Error('Não foi encontrada nenhuma placa gráfica acessível ao browser.');
   }
+
+  if (!adapter.features.has('shader-f16')) {
+    throw new Error('A tua placa gráfica não suporta shader-f16, que este modelo exige.');
+  }
+
+  return adapter.requestDevice({ requiredFeatures: ['shader-f16'] });
+}
+
+async function createRuntime(outW, outH, onStatus) {
+  onStatus?.('a preparar a placa gráfica…');
+  const device = await getDevice();
+
+  onStatus?.('a carregar o modelo (2.9 MB)…');
+  const [{ createRT }, weightsBin, weightsManifest] = await Promise.all([
+    import(`${FRAMEGEN}/rt.js`),
+    fetch(`${FRAMEGEN}/weights/rt_v7s.bin`).then((r) => r.arrayBuffer()),
+    fetch(`${FRAMEGEN}/weights/rt_v7s.json`).then((r) => r.json()),
+  ]);
+
+  return createRT(device, { w: outW, h: outH, weightsBin, weightsManifest });
+}
+
+// Desenha um frame descodificado no canvas de saída e devolve os píxeis em
+// bruto, que é o formato que o runtime aceita.
+function toRgba(sample, canvas, ctx) {
+  sample.draw(ctx, 0, 0, canvas.width, canvas.height);
+  return new Uint8Array(ctx.getImageData(0, 0, canvas.width, canvas.height).data.buffer);
+}
+
+export async function patchVideo(file, meta, { onProgress, onStatus }) {
+  // Ao contrário do modelo anterior, este aceita qualquer proporção. Vídeo
+  // vertical deixa de ser espremido numa caixa horizontal.
+  const shrink = Math.min(1, MAX_SHORT_SIDE / Math.min(meta.width, meta.height));
+  const outW = round16(meta.width * shrink);
+  const outH = round16(meta.height * shrink);
+
+  const rt = await createRuntime(outW, outH, onStatus);
 
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
   const videoTrack = await input.getPrimaryVideoTrack();
   if (!videoTrack) throw new Error('Não foi possível encontrar uma faixa de vídeo neste ficheiro.');
-
-  const decodable = await videoTrack.canDecode();
-  if (!decodable) throw new Error('Este browser não consegue descodificar este vídeo (codec não suportado).');
-
-  // Recodificar a 4K quase 4000 vezes domina o tempo total, e não compra
-  // nada: os frames sintéticos saem do modelo a 896x512 no máximo, por isso
-  // acima disto estaríamos a inventar detalhe que não existe.
-  const MAX_SHORT_SIDE = 1080;
-  const shortSide = Math.min(meta.width, meta.height);
-  const shrink = shortSide > MAX_SHORT_SIDE ? MAX_SHORT_SIDE / shortSide : 1;
-  const outW = Math.round(meta.width * shrink / 2) * 2;
-  const outH = Math.round(meta.height * shrink / 2) * 2;
+  if (!(await videoTrack.canDecode())) {
+    throw new Error('Este browser não consegue descodificar este vídeo (codec não suportado).');
+  }
 
   const duration = await input.computeDuration();
 
-  // Não há forma fiável de ler o fps "nominal" só com <video>/HTMLVideoElement
-  // (o browser não expõe isso diretamente). Em vez de adivinhar, conta-se
-  // quantos frames reais existem no primeiro segundo do próprio vídeo.
+  // O fps nominal não é exposto pelo browser, por isso conta-se quantos frames
+  // reais existem no primeiro segundo do próprio vídeo.
   let sourceFps = 30;
   {
-    const probeSink = new VideoSampleSink(videoTrack);
+    const probe = new VideoSampleSink(videoTrack);
     let count = 0;
-    for await (const s of probeSink.samples(0, Math.min(1, duration))) {
+    for await (const s of probe.samples(0, Math.min(1, duration))) {
       count++;
       s.close();
     }
@@ -223,59 +111,55 @@ export async function patchVideo(file, meta, { onnxUrl, onProgress, onStatus }) 
     target: new BufferTarget(),
   });
 
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = outW;
-  outCanvas.height = outH;
-  const outCtx = outCanvas.getContext('2d');
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-  const canvasSource = new CanvasSource(outCanvas, { codec: 'avc', bitrate: QUALITY_HIGH });
+  const canvasSource = new CanvasSource(canvas, { codec: 'avc', bitrate: QUALITY_HIGH });
   output.addVideoTrack(canvasSource);
   await output.start();
 
-  const tmpCanvas = document.createElement('canvas');
-  const tmpCtx = tmpCanvas.getContext('2d', { willReadFrequently: true });
-
   const sink = new VideoSampleSink(videoTrack);
-
-  let prevSample = null;
-  let prevPrep = null;
-  let outTimestamp = 0;
   const frameDuration = 1 / (sourceFps * 2);
-  let frameIndex = 0;
-  // Estimativa grosseira do total de frames, só para a barra de progresso.
   const estimatedTotal = Math.max(Math.round(duration * sourceFps), 1);
 
+  let prevRgba = null;
+  let outTimestamp = 0;
+  let frameIndex = 0;
+
   for await (const sample of sink.samples()) {
-    if (prevSample) {
-      // 1) frame real anterior
-      prevSample.draw(outCtx, 0, 0, outW, outH);
+    const rgba = toRgba(sample, canvas, ctx);
+    sample.close();
+
+    if (prevRgba) {
+      // O frame real anterior já está desenhado quando o escrevemos abaixo,
+      // por isso reordena-se: primeiro o anterior, depois o sintético.
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(prevRgba), outW, outH), 0, 0);
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
-      // 2) frame sintético a meio caminho entre o anterior e o atual
-      onStatus?.(`a gerar frame ${frameIndex + 1} de ~${estimatedTotal} — ${describeEngine()}`);
-      const prep = prepare(sample, ort, tmpCanvas, tmpCtx);
-      await interpolateMidFrame(session, prevPrep, prep, outCanvas, outCtx, outW, outH);
-      prevPrep = prep;
+      onStatus?.(`a gerar frame ${frameIndex} de ~${estimatedTotal}`);
+      const mid = await rt.run(prevRgba, rgba, 0.5);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(mid), outW, outH), 0, 0);
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
       onProgress?.(Math.min(frameIndex / estimatedTotal, 1));
-      prevSample.close();
     }
-    if (!prevPrep) prevPrep = prepare(sample, ort, tmpCanvas, tmpCtx);
-    prevSample = sample;
+
+    prevRgba = rgba;
     frameIndex++;
   }
 
   // Último frame real, sem par seguinte para interpolar.
-  if (prevSample) {
-    prevSample.draw(outCtx, 0, 0, outW, outH);
+  if (prevRgba) {
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(prevRgba), outW, outH), 0, 0);
     await canvasSource.add(outTimestamp, frameDuration);
-    prevSample.close();
   }
 
+  rt.destroy();
   await output.finalize();
-  onProgress?.(1);
+
   return new Blob([output.target.buffer], { type: 'video/mp4' });
 }
