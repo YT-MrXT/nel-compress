@@ -21,14 +21,20 @@ import {
   CanvasSource,
   VideoSampleSink,
   QUALITY_HIGH,
+  QUALITY_LOW,
 } from 'https://esm.sh/mediabunny@1.56.2';
 
 const FRAMEGEN = 'https://cdn.jsdelivr.net/npm/framegen@1.4.0';
 
-// O runtime exige lados múltiplos de 16. Acima de 1080 no lado curto o custo
-// dispara sem ganho visível, porque o modelo não foi treinado para mais.
-const MAX_SHORT_SIDE = 1080;
+// O runtime exige lados múltiplos de 16.
 const round16 = (n) => Math.max(16, Math.round(n / 16) * 16);
+
+// O custo cresce com o número de píxeis, por isso a resolução é o travão
+// principal. Serve para estimar quanto tempo cada método vai levar.
+export function pixelCost(meta, shortSide) {
+  const shrink = Math.min(1, shortSide / Math.min(meta.width, meta.height));
+  return round16(meta.width * shrink) * round16(meta.height * shrink);
+}
 
 export const patcherMode = {
   label: 'Patcher (interpolação de frames)',
@@ -96,14 +102,16 @@ function sampleToTexture(sample, device, scaleCanvas, scaleCtx, texture) {
   );
 }
 
-export async function patchVideo(file, meta, { onProgress, onStatus }) {
-  // Ao contrário do modelo anterior, este aceita qualquer proporção. Vídeo
+export async function patchVideo(file, meta, settings) {
+  const { shortSide, targetFps, smaller, onProgress, onStatus } = settings;
+
+  // Este modelo aceita qualquer proporção, ao contrário do anterior: vídeo
   // vertical deixa de ser espremido numa caixa horizontal.
-  const shrink = Math.min(1, MAX_SHORT_SIDE / Math.min(meta.width, meta.height));
+  const shrink = shortSide === 'source'
+    ? 1
+    : Math.min(1, Number(shortSide) / Math.min(meta.width, meta.height));
   const outW = round16(meta.width * shrink);
   const outH = round16(meta.height * shrink);
-
-  const { rt, device } = await createRuntime(outW, outH, onStatus);
 
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
   const videoTrack = await input.getPrimaryVideoTrack();
@@ -127,86 +135,125 @@ export async function patchVideo(file, meta, { onProgress, onStatus }) {
     if (count > 0) sourceFps = count / Math.min(1, duration);
   }
 
-  // Canvas 2D só para redimensionar; nunca se lêem píxeis dele.
+  // Se o destino não for acima do que o vídeo já tem, não há nada para
+  // inventar: salta-se o modelo inteiro e o trabalho reduz-se a recodificar.
+  const wantFps = targetFps === 'double' ? sourceFps * 2 : Number(targetFps);
+  const interpolate = wantFps > sourceFps + 0.5;
+
+  const gpu = interpolate ? await createRuntime(outW, outH, onStatus) : null;
+  const device = gpu?.device ?? null;
+  const rt = gpu?.rt ?? null;
+
+  // Canvas 2D para redimensionar. Sem interpolação é ele a alimentar o
+  // codificador diretamente, e nem chega a existir contexto WebGPU.
   const scaleCanvas = document.createElement('canvas');
   scaleCanvas.width = outW;
   scaleCanvas.height = outH;
   const scaleCtx = scaleCanvas.getContext('2d');
 
-  // Canvas WebGPU: é daqui que o codificador tira cada frame, e é aqui que o
-  // runtime escreve os frames sintéticos, sem passarem pelo processador.
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = outW;
-  outCanvas.height = outH;
-  const gpuCtx = outCanvas.getContext('webgpu');
-  gpuCtx.configure({
-    device,
-    format: 'rgba8unorm',
-    alphaMode: 'opaque',
-    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-  });
+  let outCanvas = scaleCanvas;
+  let gpuCtx = null;
+  let texPrev = null;
+  let texCur = null;
 
-  const makeFrameTexture = () => device.createTexture({
-    size: [outW, outH],
-    format: 'rgba8unorm',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
-      | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
-  });
+  if (interpolate) {
+    outCanvas = document.createElement('canvas');
+    outCanvas.width = outW;
+    outCanvas.height = outH;
+    gpuCtx = outCanvas.getContext('webgpu');
+    gpuCtx.configure({
+      device,
+      format: 'rgba8unorm',
+      alphaMode: 'opaque',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
 
-  let texPrev = makeFrameTexture();
-  let texCur = makeFrameTexture();
+    const makeFrameTexture = () => device.createTexture({
+      size: [outW, outH],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+        | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+
+    texPrev = makeFrameTexture();
+    texCur = makeFrameTexture();
+  }
 
   const output = new Output({
     format: new Mp4OutputFormat({ fastStart: 'in-memory' }),
     target: new BufferTarget(),
   });
 
-  const canvasSource = new CanvasSource(outCanvas, { codec: 'avc', bitrate: QUALITY_HIGH });
+  const canvasSource = new CanvasSource(outCanvas, {
+    codec: 'avc',
+    bitrate: smaller ? QUALITY_LOW : QUALITY_HIGH,
+  });
   output.addVideoTrack(canvasSource);
   await output.start();
 
   const sink = new VideoSampleSink(videoTrack);
-  const frameDuration = 1 / (sourceFps * 2);
+  const frameDuration = 1 / (interpolate ? sourceFps * 2 : sourceFps);
   const estimatedTotal = Math.max(Math.round(duration * sourceFps), 1);
 
   let hasPrev = false;
   let outTimestamp = 0;
   let frameIndex = 0;
+  const startedAt = performance.now();
+
+  const relatar = () => {
+    const elapsed = (performance.now() - startedAt) / 1000;
+    const perFrame = elapsed / Math.max(frameIndex, 1);
+    const remaining = Math.round(perFrame * (estimatedTotal - frameIndex));
+    onStatus?.(
+      `frame ${frameIndex} de ~${estimatedTotal} · ${(perFrame * 1000).toFixed(0)} ms cada · faltam ~${remaining}s`
+    );
+    onProgress?.(Math.min(frameIndex / estimatedTotal, 1));
+  };
 
   for await (const sample of sink.samples()) {
+    if (!interpolate) {
+      // Sem frames a inventar: desenhar e gravar, um por um.
+      sample.draw(scaleCtx, 0, 0, outW, outH);
+      sample.close();
+      await canvasSource.add(outTimestamp, frameDuration);
+      outTimestamp += frameDuration;
+      frameIndex++;
+      relatar();
+      continue;
+    }
+
     sampleToTexture(sample, device, scaleCanvas, scaleCtx, texCur);
+    sample.close();
 
     if (hasPrev) {
-      // 1) frame real anterior, copiado para o canvas de saída
+      // 1) frame real anterior
       copyTexture(device, texPrev, gpuCtx.getCurrentTexture(), outW, outH);
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
-      // 2) frame sintético, escrito diretamente no canvas pelo runtime
-      onStatus?.(`a gerar frame ${frameIndex} de ~${estimatedTotal}`);
+      // 2) frame sintético, escrito pelo modelo diretamente no canvas
       rt.prepPair(texPrev, texCur);
       rt.runT(0.5, gpuCtx.getCurrentTexture());
       await canvasSource.add(outTimestamp, frameDuration);
       outTimestamp += frameDuration;
 
-      onProgress?.(Math.min(frameIndex / estimatedTotal, 1));
+      relatar();
     }
 
-    sample.close();
     [texPrev, texCur] = [texCur, texPrev];
     hasPrev = true;
     frameIndex++;
   }
 
-  // Último frame real, sem par seguinte para interpolar.
-  if (hasPrev) {
+  // Último frame real, que não tem par seguinte para interpolar.
+  if (interpolate && hasPrev) {
     copyTexture(device, texPrev, gpuCtx.getCurrentTexture(), outW, outH);
     await canvasSource.add(outTimestamp, frameDuration);
   }
 
-  texPrev.destroy();
-  texCur.destroy();
-  rt.destroy();
+  texPrev?.destroy();
+  texCur?.destroy();
+  rt?.destroy();
   await output.finalize();
 
   return new Blob([output.target.buffer], { type: 'video/mp4' });
